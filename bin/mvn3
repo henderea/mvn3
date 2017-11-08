@@ -1,0 +1,241 @@
+#!/usr/bin/env ruby
+
+require 'mvn3/option'
+require 'mvn3/plugin'
+require 'everyday-plugins'
+include EverydayPlugins
+require 'thor'
+
+Plugins.load_plugins 'mvn3'
+
+class MyOptions
+  extend Mvn3::OptionUtil
+
+  def self.toggle(option, options, save)
+    prefix = save ? ' ' * 4 : ''
+    if MyOptions.option_list.options.has_key?(option.to_sym)
+      if MyOptions.option_list.options[option.to_sym].type == :option
+        MyOptions.update_profile(options, save) { MyOptions.apply_options(:arg, option.to_sym => true) }
+        prefix + 'Option set'
+      else
+        "#{prefix}Option '#{option}' is not a boolean option. use the set command"
+      end
+    else
+      "#{prefix}Option '#{option}' not known"
+    end
+  end
+
+  def self.set(option, value, options, save)
+    prefix = save ? ' ' * 4 : ''
+    if MyOptions.option_list.options.has_key?(option.to_sym)
+      if MyOptions.option_list.options[option.to_sym].type == :option_with_param
+        MyOptions.update_profile(options, save) { MyOptions.apply_options(:arg, option.to_sym => value) }
+        prefix + 'Option set'
+      else
+        "#{prefix}Option '#{option}' is a boolean option. use the toggle command"
+      end
+    else
+      "#{prefix}Option '#{option}' not known"
+    end
+  end
+
+  def self.profile_path(profile, global, extension)
+    File.expand_path("#{global ? '~' : '.'}/#{profile || 'default'}.#{extension}.yaml")
+  end
+
+  def self.should_use_profile(global, profile, saving, extra_condition = true)
+    (should_use_path(profile_path(profile, global, 'mvn3profile'), saving)) && extra_condition
+  end
+
+  def self.profile_path_with_user_default(profile, global, global_default, saving)
+    if should_use_profile(global, profile, saving, ENV[global ? 'MVN3_GLOBAL_PROFILE' : 'MVN3_LOCAL_PROFILE'])
+      profile = ENV[global ? 'MVN3_GLOBAL_PROFILE' : 'MVN3_LOCAL_PROFILE']
+    end
+    if should_use_profile(global, profile, saving, File.exist?(profile_path('profile', global_default && global, 'mvn3default')))
+      defaults = YAML::load_file(profile_path('profile', global_default && global, 'mvn3default'))
+      if defaults[global ? 'global' : 'local']
+        profile = defaults[global ? 'global' : 'local']
+      end
+    end
+    if saving
+      profile && profile_path(profile, global, 'mvn3profile')
+    else
+      if File.exist?(profile_path(profile, global, 'mvn3profile'))
+        profile_path(profile, global, 'mvn3profile')
+      else
+        profile_path(nil, global, 'mvn3profile')
+      end
+    end
+  end
+
+  def self.should_use_path(profile_path, save)
+    profile_path.nil? || (!save && !File.exist?(profile_path))
+  end
+
+  def self.true_profile_path(options, profile, save)
+    profile_override = options[options[:global] ? :global_profile : :local_profile]
+    profile_path     = profile && profile_path(profile, options[:global], 'mvn3profile')
+    profile_path     = profile_override && profile_path(profile_override, options[:global], 'mvn3profile') if should_use_path(profile_path, save)
+    profile_path     = profile_path_with_user_default(profile, options[:global], false, save) if should_use_path(profile_path, save)
+    profile_path     = profile_path_with_user_default(profile, options[:global], true, save) if should_use_path(profile_path, save)
+    profile_path     = (save ? profile_path(nil, options[:global], 'mvn3profile') : nil) if should_use_path(profile_path, save)
+    profile_path
+  end
+
+  def self.load_profile(options, profile)
+    profile_path = true_profile_path(options, profile, false)
+    unless profile_path.nil?
+      defaults_path(profile_path, options[:global])
+      load_defaults(options[:global])
+    end
+  end
+
+  def self.save_profile(options, profile)
+    profile_path = true_profile_path(options, profile, true)
+    defaults_path(profile_path, options[:global])
+    save_defaults(options[:global])
+  end
+
+  def self.update_profile(options, save = true, profile = nil)
+    reset_all if save
+    load_profile(options, profile) if save
+    yield
+    save_profile(options, profile) if save
+  end
+end
+
+module Mvn3
+  class Runner
+    def self.run(command, options, params = {})
+    end
+  end
+
+  class DefaultCommands
+    extend Plugin
+
+    register :flag, name: :global_profile, parent: nil, type: :string, desc: 'use a specific global profile instead of the default one'
+    register :flag, name: :local_profile, parent: nil, type: :string, desc: 'use a specific local profile instead of the default one'
+    register :flag, name: :debug, parent: nil, aliases: %w(-d), type: :boolean, desc: 'print out some debug info'
+
+    register(:command, id: :path, parent: nil, name: 'path', short_desc: 'path', desc: 'print out the path of the current file') { puts __FILE__ }
+
+    register :command, id: :config, parent: nil, name: 'config', short_desc: 'config SUBCOMMAND ARGS...', desc: 'work with the configuration of the current execution profile'
+    register :flag, name: :global, parent: :config, aliases: %w(-g), type: :boolean, desc: 'configure global options instead of local ones'
+
+    register(:helper, name: 'debug?', global: true) {
+      if options.has_key?('debug') || options.has_key?(:debug)
+        options[:debug]
+      else
+        d = ENV['debug']
+        d == '1' || d == 1 || d == 'true' || d == 't'
+      end
+    }
+
+    # register(:helper, name: 'print_info', global: true) { |meth, &eval_block|
+    #   meth_obj = self.method(meth)
+    #   puts "command: #{meth.to_s}"
+    #   puts "parent_options: #{parent_options.inspect}"
+    #   puts "options: #{options.inspect}"
+    #   meth_obj.parameters.each { |p| puts "#{p[1].to_s}: #{eval_block.call(p[1].to_s)}" } if eval_block
+    # }
+
+    register(:command, id: :config_info, parent: :config, name: 'info', short_desc: 'info [<option>]', desc: 'print out the information on a specific option or all options') { |option = nil|
+      # puts MyOptions.desc(option)
+      # puts "command: #{__method__}"
+      # puts "parent_options: #{parent_options.inspect}"
+      # puts "options: #{options.inspect}"
+      # puts "option: #{option}"
+      print_info(__method__) { |p| eval p } if debug?
+    }
+
+    register(:command, id: :config_toggle, parent: :config, name: 'toggle', short_desc: 'toggle <option>', desc: 'toggle the boolean option <option> in the defaults') { |option|
+      # puts MyOptions.toggle(option, options, true)
+      # puts "command: #{__method__}"
+      # puts "parent_options: #{parent_options.inspect}"
+      # puts "options: #{options.inspect}"
+      # puts "option: #{option}"
+      print_info(__method__) { |p| eval p } if debug?
+    }
+
+    register(:command, id: :config_set, parent: :config, name: 'set', short_desc: 'set <option> <value>', desc: 'set the non-boolean option <option> to <value>') { |option, value|
+      # puts MyOptions.set(option, value, options, true)
+      # puts "command: #{__method__}"
+      # puts "parent_options: #{parent_options.inspect}"
+      # puts "options: #{options.inspect}"
+      # puts "option: #{option}"
+      # puts "value: #{value}"
+      print_info(__method__) { |p| eval p } if debug?
+    }
+
+    register(:command, id: :config_unset, parent: :config, name: 'unset', short_desc: 'unset <option>', desc: 'unset the non-boolean option <option>') { |option|
+      # puts MyOptions.set(option, nil, options, true)
+      # puts "command: #{__method__}"
+      # puts "parent_options: #{parent_options.inspect}"
+      # puts "options: #{options.inspect}"
+      # puts "option: #{option}"
+      print_info(__method__) { |p| eval p } if debug?
+    }
+
+    register :command, id: :profile, parent: nil, name: 'profile', short_desc: 'profile SUBCOMMAND ARGS...', desc: 'work with your execution profiles'
+    register :flag, name: :global, parent: :profile, aliases: %w(-g), type: :boolean, desc: 'configure global profiles instead of local ones'
+
+    register(:command, id: :profile_clone, parent: :profile, name: 'clone', short_desc: 'clone [<old_profile> [<profile>]]', desc: 'create a new profile named <profile> with the settings from <old_profile> or the default profile if <old_profile> does not exist or no parameter is specified.  If <profile> is not specified, it will clone to a temporary profile and open it for editing') { |old_profile = nil, profile = nil|
+      # MyOptions.reset_all
+      # MyOptions.load_profile(options, old_profile)
+      # MyOptions.save_profile(options, profile)
+      # puts "command: #{__method__}"
+      # puts "parent_options: #{parent_options.inspect}"
+      # puts "options: #{options.inspect}"
+      # puts "old_profile: #{old_profile}"
+      # puts "profile: #{profile}"
+      print_info(__method__) { |p| eval p } if debug?
+    }
+
+    register(:command, id: :profile_create, parent: :profile, name: 'create', short_desc: 'create [<profile>]', desc: 'creates a new profile named <profile> with nothing set. If <profile> is not specified, it will create a temporary profile and open it for editing') { |profile = nil|
+      # MyOptions.reset_all
+      # MyOptions.save_profile(options, profile)
+      # puts "command: #{__method__}"
+      # puts "parent_options: #{parent_options.inspect}"
+      # puts "options: #{options.inspect}"
+      # puts "profile: #{profile}"
+      print_info(__method__) { |p| eval p } if debug?
+    }
+
+    register :command, id: :exec, parent: nil, name: 'exec', aliases: %w(build), short_desc: 'exec SUBCOMMAND ARGS...', desc: 'run a maven build and/or tests (via maven surefire)'
+    register :flag, name: :clean, parent: :exec, type: :boolean, desc: 'determine whether or not to clean before building (default is determined by profile setting)'
+    register :flag, name: :tests, parent: :exec, type: :boolean, desc: 'determine whether or not to run tests (default is determined by profile setting)'
+
+    register(:command, id: :exec_install, parent: :exec, name: 'install', short_desc: 'install', desc: 'run a "mvn [clean] install"') {
+      Runner.run(__method__, options)
+      # puts "command: #{__method__}"
+      # puts "parent_options: #{parent_options.inspect}"
+      # puts "options: #{options.inspect}"
+      print_info(__method__) { |p| eval p } if debug?
+    }
+
+    register(:command, id: :exec_package, parent: :exec, name: 'package', short_desc: 'package', desc: 'run a "mvn [clean] package"') {
+      Runner.run(__method__, options)
+      # puts "command: #{__method__}"
+      # puts "parent_options: #{parent_options.inspect}"
+      # puts "options: #{options.inspect}"
+      print_info(__method__) { |p| eval p } if debug?
+    }
+  end
+
+  # class Config < Thor
+  #   class_option :global, aliases: [:g], type: :boolean, desc: 'configure global options instead of local ones'
+  #
+  #   desc 'edit', 'open up an interactive prompt that allows you to set multiple temporary options and then save them all or run a build with the temporary options'
+  #
+  #   def edit
+  #     reset
+  #   end
+  #
+  #   include ConfigModule
+  # end
+end
+
+root_command = Class.new(Thor)
+Plugins.get :command, root_command, nil
+
+root_command.start(ARGV)
